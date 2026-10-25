@@ -26,6 +26,23 @@ logger = get_logger(__name__)
 
 
 
+DEFAULT_MAX_OBJECT_BYTES = 64 * 1024 * 1024
+
+
+class MOQTObjectTooLarge(Exception):
+    """An object declares a payload over the receiver's limit."""
+    def __init__(self, length: int, limit: int):
+        super().__init__(f"object payload {length} bytes exceeds the "
+                         f"{limit}-byte limit")
+        self.length = length
+        self.limit = limit
+
+
+def _check_payload_len(length: int, limit: int) -> None:
+    if limit and length > limit:
+        raise MOQTObjectTooLarge(length, limit)
+
+
 def encode_padding(size: int, *, prof: DraftProfile,
                    datagram: bool = False) -> bytes:
     """A PADDING stream or datagram (§11.5): its type, then `size` zero
@@ -411,7 +428,8 @@ class ObjectHeader(MOQTMessage):
                          extensions_present: bool = True,
                          prev_object_id: Optional[int] = None,
                          vi64: bool = False,
-                         kvp_delta: bool = False) -> None:
+                         kvp_delta: bool = False,
+                         max_payload: int = 0) -> None:
         """In-place fill — avoids per-object dataclass allocation.
 
         Caller pre-allocates one ObjectHeader and mutates it for each
@@ -425,6 +443,8 @@ class ObjectHeader(MOQTMessage):
         test + microbench paths that pre-bake a Buffer.
 
         vi64: select the d18 vi64 integer codec for the object fields.
+        max_payload: largest Payload Length accepted (0: no limit);
+        a larger one raises MOQTObjectTooLarge.
         """
         fused = getattr(
             buf, 'parse_object_subgroup_vi64' if vi64
@@ -441,6 +461,13 @@ class ObjectHeader(MOQTMessage):
                 # violation type; §1.4.3 makes a Type-space overflow a
                 # session close.
                 raise MOQTProtocolViolation(str(e)) from None
+            except MOQTUnderflow as e:
+                # The fused codec has no limit; a payload underflow
+                # spans the declared length.
+                _check_payload_len(e.needed - e.pos, max_payload)
+                raise
+            if max_payload and len(payload) > max_payload:
+                raise MOQTObjectTooLarge(len(payload), max_payload)
         except AttributeError:
             pull = buf.pull_uint_vi64 if vi64 else buf.pull_uint_var
             delta = pull()
@@ -449,6 +476,7 @@ class ObjectHeader(MOQTMessage):
             else:
                 exts = None
             payload_len = pull()
+            _check_payload_len(payload_len, max_payload)
             remaining = buf_len - buf.tell()
             if payload_len == 0:
                 status = pull()
@@ -718,6 +746,11 @@ class FetchObject(MOQTMessage):
             buf.push_uint_var(self.object_id)
             return buf
 
+        if self.status != ObjectStatus.NORMAL:
+            raise ValueError(
+                "FetchObject: FETCH objects carry no Object Status at d16 "
+                "(§10.2.1.1)")
+
         # Default: emit fully-explicit object (no delta refs).
         # Subgroup mode = 0x03 (present), object/group/priority present;
         # a datagram carries no Subgroup ID.
@@ -739,35 +772,35 @@ class FetchObject(MOQTMessage):
             MOQTMessage._extensions_encode(buf, self.extensions,
                                            delta=True)
 
-        # Payload length and payload
-        if self.status == ObjectStatus.NORMAL and len(self.payload) > 0:
-            buf.push_uint_var(len(self.payload))
-            buf.push_bytes(self.payload)
-        else:
-            buf.push_uint_var(0)
-            buf.push_uint_var(self.status)
+        buf.push_uint_var(len(self.payload))
+        buf.push_bytes(self.payload)
         return buf
 
     @classmethod
     def deserialize(cls, buf: Buffer,
                     prior: Optional['FetchObject'] = None,
                     *, prof: DraftProfile,
-                    group_order: int = 0x1) -> 'FetchObject':
+                    group_order: int = 0x1,
+                    max_payload: int = 0) -> 'FetchObject':
+        """max_payload: largest Payload Length accepted (0: no limit);
+        a larger one raises MOQTObjectTooLarge."""
         if prof.vi64:
-            return cls._deserialize_d18(buf, prior, group_order, prof)
+            return cls._deserialize_d18(buf, prior, group_order, prof,
+                                        max_payload)
         if is_draft16_or_later(prof.draft):
-            return cls._deserialize_d16(buf, prior)
-        return cls._deserialize_d14(buf)
+            return cls._deserialize_d16(buf, prior, max_payload)
+        return cls._deserialize_d14(buf, max_payload)
 
     @classmethod
     def _deserialize_d18(cls, buf: Buffer,
                          prior: Optional['FetchObject'],
                          group_order: int,
-                         prof: DraftProfile) -> 'FetchObject':
+                         prof: DraftProfile,
+                         max_payload: int = 0) -> 'FetchObject':
         """d18 §11.4.4 delta decode. The buffer's varint codec is vi64
-        (set by the stream-type read). A zero Payload Length is followed
-        by an explicit Status varint where the profile says so (moxygen's
-        d18 reading); End-of-Range markers stand in for missing ranges."""
+        (set by the stream-type read). FETCH objects carry no Object
+        Status (§11.2.1.1); End-of-Range markers stand in for missing
+        ranges."""
         flags = buf.pull_vint()
         if flags in _end_of_range_flags(prof):
             group_id = buf.pull_vint()
@@ -846,6 +879,7 @@ class FetchObject(MOQTMessage):
             extensions = None
 
         payload_len = buf.pull_vint()
+        _check_payload_len(payload_len, max_payload)
         if payload_len == 0:
             status = (ObjectStatus(buf.pull_vint())
                       if prof.fetch_object_status else ObjectStatus.NORMAL)
@@ -869,13 +903,15 @@ class FetchObject(MOQTMessage):
         )
 
     @classmethod
-    def _deserialize_d14(cls, buf: Buffer) -> 'FetchObject':
+    def _deserialize_d14(cls, buf: Buffer,
+                         max_payload: int = 0) -> 'FetchObject':
         group_id = buf.pull_uint_var()
         subgroup_id = buf.pull_uint_var()
         object_id = buf.pull_uint_var()
         publisher_priority = buf.pull_uint8()
         extensions = MOQTMessage._extensions_decode(buf)
         payload_len = buf.pull_uint_var()
+        _check_payload_len(payload_len, max_payload)
         if payload_len == 0:
             status = ObjectStatus(buf.pull_uint_var())
             payload = b''
@@ -894,7 +930,8 @@ class FetchObject(MOQTMessage):
 
     @classmethod
     def _deserialize_d16(cls, buf: Buffer,
-                         prior: Optional['FetchObject']) -> 'FetchObject':
+                         prior: Optional['FetchObject'],
+                         max_payload: int = 0) -> 'FetchObject':
         flags = buf.pull_uint_var()
 
         # End-of-range markers
@@ -957,14 +994,10 @@ class FetchObject(MOQTMessage):
         else:
             extensions = None
 
-        # Payload length and payload (with optional Status)
+        # No Object Status follows a zero Payload Length (§10.2.1.1).
         payload_len = buf.pull_uint_var()
-        if payload_len == 0:
-            status = ObjectStatus(buf.pull_uint_var())
-            payload = b''
-        else:
-            status = ObjectStatus.NORMAL
-            payload = buf.pull_bytes(payload_len)
+        _check_payload_len(payload_len, max_payload)
+        payload = buf.pull_bytes(payload_len) if payload_len else b''
 
         return cls(
             group_id=group_id,
@@ -972,7 +1005,7 @@ class FetchObject(MOQTMessage):
             object_id=object_id,
             publisher_priority=publisher_priority,
             extensions=extensions,
-            status=status,
+            status=ObjectStatus.NORMAL,
             payload=payload,
             datagram=bool(flags & FETCH_FLAG_DATAGRAM),
         )

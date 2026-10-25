@@ -321,45 +321,99 @@ def test_d18_fetch_first_object_must_be_absolute():
         FetchObject.deserialize(rb, prior=None, prof=prof)
 
 
-def test_d18_fetch_zero_length_encodes_status():
-    # Golden bytes per moxygen's writer (writeStreamObject): a zero
-    # Payload Length is followed by an explicit Status varint.
+def test_d18_fetch_zero_length_carries_no_status():
     objs = [
         FetchObject(group_id=1, subgroup_id=0, object_id=0,
                     publisher_priority=200, payload=b"tt"),
         FetchObject(group_id=1, subgroup_id=0, object_id=1,
                     publisher_priority=200, payload=b""),
-        FetchObject(group_id=1, subgroup_id=0, object_id=2,
-                    publisher_priority=200,
-                    status=ObjectStatus.END_OF_GROUP, payload=b""),
     ]
     chain = _fetch_chain_roundtrip(objs)
     # First: flags GD|OD|PRI = 0x1C, absolute ids, len 2 + payload.
     assert chain[0][0] == bytes.fromhex("1c0100c8027474")
-    # Zero-length Normal: flags 0, len 0, explicit status 0.
-    assert chain[1][0] == bytes.fromhex("000000")
-    # End of Group: flags 0, len 0, status 3.
-    assert chain[2][0] == bytes.fromhex("000003")
-    assert [g.status for _, g in chain] == [
-        ObjectStatus.NORMAL, ObjectStatus.NORMAL, ObjectStatus.END_OF_GROUP]
-    assert [g.payload for _, g in chain] == [b"tt", b"", b""]
+    # Zero-length Normal: flags 0, len 0, nothing after.
+    assert chain[1][0] == bytes.fromhex("0000")
+    assert [g.payload for _, g in chain] == [b"tt", b""]
 
 
-def test_d18_fetch_non_normal_status_guards():
-    prof = profile_for(18)
-    with pytest.raises(ValueError, match="empty payload"):
-        FetchObject(group_id=1, object_id=0,
-                    status=ObjectStatus.END_OF_GROUP,
-                    payload=b"x").serialize(prof=prof)
-    with pytest.raises(ValueError, match="non-Normal"):
-        FetchObject(group_id=1, object_id=0,
-                    status=ObjectStatus.END_OF_GROUP,
-                    extensions={8: 1}, payload=b"").serialize(prof=prof)
-    # RX: properties on a non-Normal object close the parse.
-    raw = bytes.fromhex("3c0100c802080500 03".replace(" ", ""))
-    rb = Buffer(data=raw, vi64=True)
-    with pytest.raises(ValueError, match="non-Normal"):
-        FetchObject.deserialize(rb, prior=None, prof=prof)
+# d14 §10.4.4 keeps the Status after a zero Payload Length; d16
+# §10.2.1.1 and d18 §11.2.1.1: absent in Objects delivered via a FETCH.
+@pytest.mark.parametrize("draft, raw", [
+    (14, "05000c80000000"),
+    (16, "1f05000c8000"),
+    (18, "1c050c8000"),
+])
+def test_fetch_zero_length_object_status_by_draft(draft, raw):
+    prof = profile_for(draft)
+    obj = FetchObject(group_id=5, object_id=12, publisher_priority=128)
+    assert bytes(obj.serialize(prof=prof).data) == bytes.fromhex(raw)
+    got = FetchObject.deserialize(
+        Buffer(data=bytes.fromhex(raw), vi64=prof.vi64), prof=prof)
+    assert (got.object_id, got.payload, got.status) == (
+        12, b"", ObjectStatus.NORMAL)
+
+
+def test_d14_fetch_end_of_group_keeps_its_status():
+    prof = profile_for(14)
+    raw = bytes(FetchObject(group_id=5, object_id=12, publisher_priority=128,
+                            status=ObjectStatus.END_OF_GROUP)
+                .serialize(prof=prof).data)
+    assert raw == bytes.fromhex("05000c80000003")
+    got = FetchObject.deserialize(Buffer(data=raw), prof=prof)
+    assert got.status == ObjectStatus.END_OF_GROUP
+
+
+@pytest.mark.parametrize("draft", [16, 18])
+def test_fetch_object_with_status_is_not_encoded(draft):
+    with pytest.raises(ValueError, match="no Object Status"):
+        FetchObject(group_id=5, object_id=12, publisher_priority=128,
+                    status=ObjectStatus.END_OF_GROUP).serialize(
+                        prof=profile_for(draft))
+
+
+@pytest.mark.parametrize("draft, raw", [
+    (16, "1f05000c800003"),
+    (18, "1c050c800003"),
+])
+def test_fetch_object_with_trailing_status_does_not_parse(draft, raw):
+    # aiomoqt 0.13.2's form: the Status reads as the next object's
+    # Serialization Flags (0x03: Subgroup ID present), then runs short.
+    prof = profile_for(draft)
+    rb = Buffer(data=bytes.fromhex(raw), vi64=prof.vi64)
+    first = FetchObject.deserialize(rb, prof=prof)
+    assert (first.object_id, first.status) == (12, ObjectStatus.NORMAL)
+    with pytest.raises(Exception):
+        FetchObject.deserialize(rb, prior=first, prof=prof)
+
+
+# A whole-group FETCH of an evicted group: the End of Unknown Range
+# marker ends at Object ID 2^62-1, which both varint codecs carry.
+@pytest.mark.parametrize("draft, raw", [
+    (16, "410c" "02" "ffffffffffffffff"),
+    (18, "810c" "02" "ff3fffffffffffffff"),
+])
+def test_whole_group_unknown_range_marker_bytes(draft, raw):
+    from aiomoqt.delivery import ObjectHistory
+    from aiomoqt.messages.data import FETCH_FLAGS_END_UNKNOWN
+    prof = profile_for(draft)
+    h = ObjectHistory(4000)
+    for g in range(10):
+        for o in range(5):
+            h.add(g, o, b"x" * 100)
+    marker, = h.fetch((2, 0), (2, 1 << 62))
+    assert bytes(marker.serialize(prof=prof).data) == bytes.fromhex(raw)
+    got = FetchObject.deserialize(
+        Buffer(data=bytes.fromhex(raw), vi64=prof.vi64), prof=prof)
+    assert (got.end_of_range, got.group_id, got.object_id) == (
+        FETCH_FLAGS_END_UNKNOWN, 2, (1 << 62) - 1)
+
+
+def test_d16_object_id_past_the_varint_is_not_encoded():
+    from aiomoqt.messages.data import FETCH_FLAGS_END_UNKNOWN
+    with pytest.raises(ValueError, match="too large"):
+        FetchObject(group_id=2, object_id=1 << 62,
+                    end_of_range=FETCH_FLAGS_END_UNKNOWN).serialize(
+                        prof=profile_for(16))
 
 
 def test_d18_fetch_first_object_sg_prior_rejected():
@@ -1187,26 +1241,52 @@ def _unparams(raw, draft, scope=None):
 _NO_SUBGROUP_FILTER = RangeFilter(set_id=None)
 
 
+# d20 §10.2.15, d22 §9.20.15: FILL_PARAMETERS is length-prefixed; its
+# value is a parameter block as for a separate message (Number of
+# Parameters, then Parameters). Bytes derived by hand.
 @pytest.mark.parametrize("draft", [20, 22])
 @pytest.mark.parametrize("params, raw", [
-    ({0x23: {0x0A: 5}}, "01" "23" "01" "0a05"),
-    ({0x23: {0x21: LocationFilter.relative(1)}}, "01" "23" "01" "210101"),
+    ({0x23: {0x21: LocationFilter.relative(2)}}, "01" "23" "04" "01210102"),
+    ({0x23: {0x0A: 5}}, "01" "23" "03" "010a05"),
     ({0x23: {0x0A: 5, 0x21: LocationFilter.relative(1)},
       0x25: [_NO_SUBGROUP_FILTER]},
-     "02" "23" "02" "0a05" "170101" "02" "00"),
-    ({0x23: {}}, "01" "23" "00"),
-], ids=["fill-only", "location-filter", "then-subgroup-filter", "empty"])
-def test_fill_parameters_is_count_prefixed(draft, params, raw):
-    # moq-transport PR #2015: Number of Parameters, then the Parameters,
-    # with no Length; LOCATION_FILTER inside keeps its own encoding.
+     "02" "23" "06" "020a05170101" "02" "00"),
+    ({0x23: {}}, "01" "23" "01" "00"),
+], ids=["location-filter", "fill-only", "then-subgroup-filter", "empty"])
+def test_fill_parameters_is_length_prefixed(draft, params, raw):
     assert _params(params, draft) == bytes.fromhex(raw)
     assert _unparams(bytes.fromhex(raw), draft) == params
 
 
 def test_d22_fill_nests_the_typed_location_filter():
     raw = _params({0x23: {0x21: LocationFilter.next_object()}}, 22)
-    assert raw == bytes.fromhex("01" "23" "01" "2105")
+    assert raw == bytes.fromhex("01" "23" "03" "012105")
     assert _unparams(raw, 22) == {0x23: {0x21: LocationFilter.next_object()}}
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+@pytest.mark.parametrize("raw, fill", [
+    ("01" "23" "01" "210102", {0x21: LocationFilter.relative(2)}),
+    ("01" "23" "01" "0a05", {0x0A: 5}),
+    ("02" "23" "02" "0a05170101" "02" "00",
+     {0x0A: 5, 0x21: LocationFilter.relative(1)}),
+    ("01" "23" "00", {}),
+], ids=["location-filter", "fill-only", "then-subgroup-filter", "empty"])
+def test_count_prefixed_fill_parameters_is_still_read(draft, raw, fill):
+    # moq-transport PR #2015 (aiomoqt 0.13.2): Number of Parameters,
+    # then the Parameters, with no Length.
+    assert _unparams(bytes.fromhex(raw), draft)[0x23] == fill
+
+
+@pytest.mark.parametrize("draft", [20, 22])
+@pytest.mark.parametrize("raw", [
+    "01" "23" "03" "01210102",
+    "01" "23" "02" "02" "0a05",
+], ids=["one-byte-short", "count-past-length"])
+def test_fill_length_shorter_than_its_count_is_a_protocol_violation(draft,
+                                                                    raw):
+    with pytest.raises(MOQTProtocolViolation):
+        _unparams(bytes.fromhex(raw), draft)
 
 
 @pytest.mark.parametrize("raw, fill", [
@@ -1219,11 +1299,56 @@ def test_length_prefixed_fill_parameters_is_still_read(raw, fill):
     assert _unparams(bytes.fromhex(raw), 20) == {0x23: fill}
 
 
+@pytest.mark.parametrize("draft", [20, 22])
+@pytest.mark.parametrize("raw, fill", [
+    ("01" "23" "03" "210101", {0x21: LocationFilter.relative(1)}),
+    ("01" "23" "05" "0a05" "170101",
+     {0x0A: 5, 0x21: LocationFilter.relative(1)}),
+    ("01" "23" "00", {}),
+    ("01" "23" "06" "02" "0a05" "170101",
+     {0x0A: 5, 0x21: LocationFilter.relative(1)}),
+], ids=["bare-one", "bare-two", "empty-value", "length-and-count"])
+def test_length_prefixed_fill_value_is_counted_or_bare(draft, raw, fill):
+    # A first varint below 0x0A (no Table 7 type is) is a Number of
+    # Parameters; otherwise the parameters run to the value's end.
+    assert _unparams(bytes.fromhex(raw), draft) == {0x23: fill}
+
+
+def test_d22_subscribe_with_bare_length_prefixed_fill_decodes():
+    # LOCATION_FILTER Next Object, then FILL_PARAMETERS Length 3 holding
+    # a bare LOCATION_FILTER Relative Start 1.
+    raw = bytes.fromhex("03001e00010b67352d343431306562386307636174616c6f67"
+                        "0221050203210101")
+    assert int.from_bytes(raw[1:3], "big") == len(raw) - 3
+    got = _decode_subscribe(22, raw[3:])
+    assert (got.track_namespace, got.track_name) == ((b"g5-4410eb8c",),
+                                                     b"catalog")
+    assert got.location_filter == LocationFilter.next_object()
+    assert got.parameters[0x23] == {0x21: LocationFilter.relative(1)}
+
+
+@pytest.mark.parametrize("raw, match", [
+    ("01" "23" "02" "210101", "unknown message parameter|truncated|"
+     "overran|overruns|exceeds|exhausted"),
+    ("01" "23" "02" "1001", "not allowed in FillParameters"),
+    ("01" "23" "02" "7f01", "unknown message parameter"),
+    ("01" "23" "03" "02" "0a05", "exhausted|unknown message parameter"),
+    ("01" "23" "05" "01" "0a05" "0a", "does not fill its length|"
+     "duplicate|exhausted|unknown"),
+], ids=["bare-overruns-length", "bare-forward-inside", "bare-unknown-type",
+        "count-beyond-content", "count-short-of-content"])
+def test_malformed_length_prefixed_fill_value_is_a_protocol_violation(
+        raw, match):
+    for draft in (20, 22):
+        with pytest.raises(MOQTProtocolViolation, match=match):
+            _unparams(bytes.fromhex(raw), draft)
+
+
 @pytest.mark.parametrize("raw, match", [
     ("012305" "01210101", "unknown message parameter|exceeds remaining"),
     ("012305" "0121010100", "does not fill its length"),
     ("012303" "011001", "not allowed in FillParameters"),
-    ("0123" "02" "0a05", "exhausted"),
+    ("0123" "03" "0a05", "exhausted"),
     ("0123" "ffff", "out of bounds"),
 ], ids=["past-message", "short-of-length", "forward-inside",
         "count-beyond-bytes", "junk"])
@@ -1233,15 +1358,19 @@ def test_malformed_fill_parameters_is_a_protocol_violation(raw, match):
 
 
 @pytest.mark.parametrize("draft", [20, 22])
-@pytest.mark.parametrize("raw", ["0123" "01" "0301ff", "012304" "010301ff"],
+@pytest.mark.parametrize("raw, counted", [("0123" "01" "0301ff", True),
+                                          ("012304" "010301ff", False)],
                          ids=["counted", "length-prefixed"])
 def test_forbidden_fill_parameter_closes_before_its_value_is_decoded(
-        draft, raw):
+        draft, raw, counted):
     # AUTHORIZATION_TOKEN (0x03) with an undecodable value inside
     # FILL_PARAMETERS: the scope check (Table 7) comes first.
+    raw = bytes.fromhex(raw)
     with pytest.raises(MOQTProtocolViolation, match="not allowed in "
                        "FillParameters"):
-        _unparams(bytes.fromhex(raw), draft)
+        MOQTMessage._pull_params(Buffer(data=raw, vi64=True),
+                                 prof=_prof(draft), buf_end=len(raw),
+                                 fill_counted=counted)
 
 
 def test_namespace_prefix_parameter_d20_prefixed_d22_bare():
@@ -1581,3 +1710,269 @@ def test_d16_zero_delivery_timeout_track_property_is_a_protocol_violation():
     props = _ref_vint(16, 0x02) + _ref_vint(16, 0)
     with pytest.raises(MOQTProtocolViolation, match="DELIVERY_TIMEOUT"):
         _imm_decode(16, "subscribe_ok", props)
+
+
+# -- draft-frindell-moq-timestamp-00 properties (§3-§5, §9) -------------
+#
+# Track Properties: TIMESCALE 0x2C7A51E0, CLOCK_ID 0x3E8D2B70 and
+# TIMESTAMP_ORIGIN 0x31B49A6E are even (bare integer); TIMESTAMP_MAPPING
+# 0x27F308C5 is odd (length-prefixed), holding four integers. Object
+# Property OBJECT_TIMESTAMP 0x2D1A (even). Integers follow the session:
+# RFC 9000 varints at d16, vi64 from d18. Types are delta-coded.
+
+from types import SimpleNamespace  # noqa: E402
+
+from aiomoqt.track import PublishedTrack  # noqa: E402
+from aiomoqt.utils.timing import (  # noqa: E402
+    CLOCK_ID, OBJECT_TIMESTAMP, TIMESCALE, TIMESTAMP_MAPPING,
+    TIMESTAMP_ORIGIN, TimestampMalformed, TrackTiming, capture_time_us,
+    check_object, encode_mapping,
+)
+
+_W = 1_767_225_600_000_000
+
+
+def _ref_delta_kvps(draft, pairs):
+    """Delta-coded Key-Value-Pairs from (type, int | bytes), in order."""
+    v = lambda x: _ref_vint(draft, x)  # noqa: E731
+    out, prev = b"", 0
+    for ptype, value in pairs:
+        out += v(ptype - prev)
+        prev = ptype
+        out += (v(value) if ptype % 2 == 0
+                else v(len(value)) + value)
+    return out
+
+
+def _ref_mapping(draft, *ints):
+    return b"".join(_ref_vint(draft, i) for i in ints)
+
+
+def _track_timing(draft, kind, pairs):
+    msg = _imm_decode(draft, kind, _ref_delta_kvps(draft, pairs))
+    return TrackTiming.from_properties(
+        msg.track_extensions, profile_for(draft).vi64,
+        getattr(msg.track_extensions, 'duplicates', ()))
+
+
+_FRINDELL_DRAFTS = [16, 18]
+
+
+@pytest.mark.parametrize("kind", list(_IMM_MESSAGES))
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+def test_frindell_track_properties_decode(draft, kind):
+    base_ts = _W * 30000 // 1_000_000
+    mapping = _ref_mapping(draft, 5, base_ts, 60060, 1001)
+    t = _track_timing(draft, kind, [
+        (TIMESTAMP_MAPPING, mapping), (TIMESCALE, 30000),
+        (TIMESTAMP_ORIGIN, 0), (CLOCK_ID, 0)])
+    assert (t.timescale, t.clock_id, t.origin) == (30000, 0, 0)
+    assert t.mapping == (5, base_ts, 60060, 1001)
+    # The encoder writes the same value bytes.
+    assert encode_mapping(5, base_ts, 60060, 1001,
+                          profile_for(draft).vi64) == mapping
+
+
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+def test_frindell_track_properties_encode_exact_bytes(draft):
+    vi64 = profile_for(draft).vi64
+    mapping = encode_mapping(0, 7, 1000, 10, vi64)
+    track = PublishedTrack(None, namespace="n", trackname="t",
+                           track_properties={TIMESCALE: 1000,
+                                             TIMESTAMP_MAPPING: mapping})
+    s = SimpleNamespace(_profile=profile_for(draft))
+    buf = Buffer(capacity=64, vi64=vi64)
+    MOQTMessage._extensions_encode(buf, track._track_properties(s),
+                                   with_length=False, delta=True)
+    assert bytes(buf.data_slice(0, buf.tell())) == _ref_delta_kvps(draft, [
+        (TIMESTAMP_MAPPING, _ref_mapping(draft, 0, 7, 1000, 10)),
+        (TIMESCALE, 1000)])
+
+
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+@pytest.mark.parametrize("case", [
+    "duplicate-timescale", "object-timestamp-on-track", "timescale-0",
+    "no-timescale", "origin-without-clock", "mapping-3", "mapping-5",
+    "mapping-trailing-byte", "mapping-truncated"])
+def test_malformed_frindell_track_properties(draft, case):
+    v = lambda x: _ref_vint(draft, x)  # noqa: E731
+    four = _ref_mapping(draft, 0, 1, 2, 3)
+    pairs, why = {
+        "duplicate-timescale": ([(TIMESCALE, 1000), (TIMESCALE, 1000)],
+                                "more than once"),
+        "object-timestamp-on-track": ([(OBJECT_TIMESTAMP, 1),
+                                       (TIMESCALE, 1000)],
+                                      "as a Track Property"),
+        "timescale-0": ([(TIMESCALE, 0)], "TIMESCALE missing or 0"),
+        "no-timescale": ([(CLOCK_ID, 0)], "TIMESCALE missing"),
+        "origin-without-clock": ([(TIMESCALE, 1000),
+                                  (TIMESTAMP_ORIGIN, 9)],
+                                 "without CLOCK_ID"),
+        "mapping-3": ([(TIMESTAMP_MAPPING, _ref_mapping(draft, 0, 1, 2)),
+                       (TIMESCALE, 1000)], "four integers"),
+        "mapping-5": ([(TIMESTAMP_MAPPING, four + v(4)),
+                       (TIMESCALE, 1000)], "four integers"),
+        "mapping-trailing-byte": ([(TIMESTAMP_MAPPING, four + b"\x00"),
+                                   (TIMESCALE, 1000)], "four integers"),
+        # A multi-byte integer cut short inside the value.
+        "mapping-truncated": ([(TIMESTAMP_MAPPING,
+                                _ref_mapping(draft, 0, 1, 2) + v(1 << 20)[:1]),
+                               (TIMESCALE, 1000)], "four integers"),
+    }[case]
+    with pytest.raises(TimestampMalformed, match=why):
+        _track_timing(draft, "subscribe_ok", pairs)
+
+
+def _object_block(draft, pairs):
+    body = _ref_delta_kvps(draft, pairs)
+    return _ref_vint(draft, len(body)) + body
+
+
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+@pytest.mark.parametrize("correction, wire", [(0, 0), (-1, 1), (1, 2),
+                                             (-300, 599), (300, 600)])
+def test_object_timestamp_zigzag_both_codecs(draft, correction, wire):
+    vi64 = profile_for(draft).vi64
+    block = _object_block(draft, [(0x10, _W), (OBJECT_TIMESTAMP, wire)])
+    py = MOQTMessage._extensions_decode(Buffer(data=block, vi64=vi64),
+                                        delta=True)
+    chain = StreamChain()
+    chain.extend(_ref_vint(draft, 0) + block + _ref_vint(draft, 3) + b"pay")
+    fused = (chain.parse_object_subgroup_vi64 if vi64
+             else chain.parse_object_subgroup)
+    assert fused(True, 16 * 1024, True)[1] == py
+    t = TrackTiming(timescale=1_000_000, mapping=(0, _W, 0, 0))
+    assert capture_time_us(t, 0, 0, py)[0] == _W + correction
+
+
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+def test_explicit_object_timestamp_both_codecs(draft):
+    vi64 = profile_for(draft).vi64
+    block = _object_block(draft, [(OBJECT_TIMESTAMP, _W)])
+    py = MOQTMessage._extensions_decode(Buffer(data=block, vi64=vi64),
+                                        delta=True)
+    assert py == {OBJECT_TIMESTAMP: _W}
+    assert capture_time_us(TrackTiming(timescale=1_000_000), 0, 0, py) == (
+        _W, "frindell")
+
+
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+@pytest.mark.parametrize("case", [
+    "duplicate", "timescale-on-object", "mapping-on-object",
+    "clock-on-object", "origin-on-object", "no-track-timescale",
+    "negative", "past-2-64"])
+def test_malformed_frindell_objects(draft, case):
+    vi64 = profile_for(draft).vi64
+    mapped = TrackTiming(timescale=1000, mapping=(10, 0, 1000, 1))
+    timing, gid, pairs, why = {
+        "duplicate": (mapped, 10, [(OBJECT_TIMESTAMP, 2),
+                                   (OBJECT_TIMESTAMP, 4)], "more than once"),
+        "timescale-on-object": (mapped, 10, [(TIMESCALE, 1000)],
+                                "TIMESCALE as an Object"),
+        "mapping-on-object": (mapped, 10, [(TIMESTAMP_MAPPING, b"\x00")],
+                              "TIMESTAMP_MAPPING as an Object"),
+        "clock-on-object": (None, 0, [(CLOCK_ID, 0)], "CLOCK_ID as an"),
+        "origin-on-object": (None, 0, [(TIMESTAMP_ORIGIN, 0)],
+                             "TIMESTAMP_ORIGIN as an"),
+        "no-track-timescale": (None, 0, [(OBJECT_TIMESTAMP, 5)],
+                               "without TIMESCALE"),
+        # Group 9 maps to -1000; a correction of +999 leaves it negative.
+        "negative": (mapped, 9, [(OBJECT_TIMESTAMP, 1998)], "outside"),
+        "past-2-64": (TrackTiming(timescale=1, mapping=(0, (1 << 62) - 1,
+                                                        1 << 62, 0)),
+                      4, [], "outside"),
+    }[case]
+    py = MOQTMessage._extensions_decode(
+        Buffer(data=_object_block(draft, pairs), vi64=vi64), delta=True)
+    with pytest.raises(TimestampMalformed, match=why):
+        check_object(timing, gid, 0, py)
+
+
+@pytest.mark.parametrize("draft", _FRINDELL_DRAFTS)
+def test_aiopquic_object_codec_keeps_the_last_duplicate(draft):
+    """Subgroup objects are decoded by aiopquic, which keeps the last of
+    a repeated type and does not mark it; only the Python codec
+    (datagrams, FETCH) can report the duplicate."""
+    vi64 = profile_for(draft).vi64
+    block = _object_block(draft, [(OBJECT_TIMESTAMP, 2),
+                                  (OBJECT_TIMESTAMP, 4)])
+    chain = StreamChain()
+    chain.extend(_ref_vint(draft, 0) + block + _ref_vint(draft, 3) + b"pay")
+    fused = (chain.parse_object_subgroup_vi64 if vi64
+             else chain.parse_object_subgroup)
+    exts = fused(True, 16 * 1024, True)[1]
+    assert exts == {OBJECT_TIMESTAMP: 4}
+    assert not getattr(exts, 'duplicates', None)
+
+
+# -- an object declaring more payload than the receiver accepts -------
+#
+# A Payload Length is the receiver's commitment to buffer that much.
+# Over the session's limit it is refused at the length, before any of
+# the payload arrives, by both subgroup codecs and every FETCH shape.
+
+from aiomoqt.messages.data import ObjectHeader, MOQTObjectTooLarge  # noqa: E402
+
+_LIMIT = 1024
+
+
+def _subgroup_object(draft, declared, present):
+    v = lambda x: _ref_vint(draft, x)                     # noqa: E731
+    return v(0) + v(0) + v(declared) + b"p" * present     # delta, no props
+
+
+def _parse_subgroup(draft, raw, fused):
+    vi64 = profile_for(draft).vi64
+    if fused:
+        buf = StreamChain()
+        buf.extend(raw)
+    else:
+        buf = Buffer(data=raw, vi64=vi64)
+    obj = ObjectHeader(object_id=0)
+    obj.deserialize_into(buf, len(raw), extensions_present=True, vi64=vi64,
+                         kvp_delta=draft >= 16, max_payload=_LIMIT)
+    return obj
+
+
+@pytest.mark.parametrize("fused", [True, False], ids=["cython", "python"])
+@pytest.mark.parametrize("draft", [14, 16, 18, 20, 22])
+@pytest.mark.parametrize("declared", [_LIMIT + 1, 1 << 40])
+def test_subgroup_object_over_the_limit_is_refused_at_its_length(
+        draft, fused, declared):
+    raw = _subgroup_object(draft, declared, 8)
+    with pytest.raises(MOQTObjectTooLarge) as e:
+        _parse_subgroup(draft, raw, fused)
+    assert (e.value.length, e.value.limit) == (declared, _LIMIT)
+
+
+@pytest.mark.parametrize("fused", [True, False], ids=["cython", "python"])
+@pytest.mark.parametrize("draft", [14, 18])
+def test_subgroup_object_at_the_limit_is_accepted(draft, fused):
+    obj = _parse_subgroup(draft, _subgroup_object(draft, _LIMIT, _LIMIT),
+                          fused)
+    assert len(obj.payload) == _LIMIT
+
+
+@pytest.mark.parametrize("fused", [True, False], ids=["cython", "python"])
+def test_a_complete_object_over_the_limit_is_refused(fused):
+    with pytest.raises(MOQTObjectTooLarge):
+        _parse_subgroup(18, _subgroup_object(18, _LIMIT + 1, _LIMIT + 1),
+                        fused)
+
+
+@pytest.mark.parametrize("draft", [14, 16, 18, 22])
+def test_fetch_object_over_the_limit_is_refused_at_its_length(draft):
+    prof = profile_for(draft)
+    obj = FetchObject(group_id=1, subgroup_id=0, object_id=0,
+                      publisher_priority=128, payload=b"f" * (_LIMIT + 1))
+    raw = bytes(obj.serialize(prof=prof).data)
+    for present in (raw[:-_LIMIT], raw):                # partial and whole
+        with pytest.raises(MOQTObjectTooLarge):
+            FetchObject.deserialize(Buffer(data=present, vi64=prof.vi64),
+                                    prof=prof, max_payload=_LIMIT)
+    ok = FetchObject(group_id=1, subgroup_id=0, object_id=0,
+                     publisher_priority=128, payload=b"f" * _LIMIT)
+    got = FetchObject.deserialize(
+        Buffer(data=bytes(ok.serialize(prof=prof).data), vi64=prof.vi64),
+        prof=prof, max_payload=_LIMIT)
+    assert len(got.payload) == _LIMIT

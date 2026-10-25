@@ -1,3 +1,4 @@
+import itertools
 import os
 from typing import Any, Optional, Union, Dict, Tuple
 from dataclasses import dataclass, field, fields
@@ -26,6 +27,13 @@ BUF_SIZE = 4 * 1024  # 4KB buffer size for messages
 # catchable as MOQTUnderflow in aiomoqt without introducing an upward
 # dependency (aiopquic must not import aiomoqt).
 from aiopquic.exceptions import StreamUnderflow as MOQTUnderflow  # noqa: E402
+
+
+class KeyValuePairs(dict):
+    """A decoded Key-Value-Pair block in which some Type appeared more
+    than once; the dict keeps the last value of each, `duplicates` names
+    them."""
+    __slots__ = ('duplicates',)
 
 
 @dataclass(frozen=True, slots=True)
@@ -343,6 +351,7 @@ class MOQTMessage:
                 return None
 
         exts = {}
+        dups = None
         prev = 0
         while buf.tell() < exts_end:
             kvp_start = buf.tell()
@@ -422,8 +431,13 @@ class MOQTMessage:
                     f"exts_end={exts_end} kvp_start={kvp_start} "
                     f"ext_id=0x{ext_id:x}"
                 )
+            if ext_id in exts:
+                dups = {ext_id} if dups is None else dups | {ext_id}
             exts[ext_id] = ext_value
 
+        if dups is not None:
+            exts = KeyValuePairs(exts)
+            exts.duplicates = frozenset(dups)
         return exts if exts else None
           
     @staticmethod
@@ -689,10 +703,8 @@ class MOQTMessage:
                     param_value.encode(payload, prof=prof)
                 elif kind == "range_filter":
                     param_value.encode(payload, param_type, prof=prof)
-                elif kind == "fill" and prof.fill_parameters_counted:
-                    MOQTMessage._serialize_params(payload, param_value,
-                                                  prof=prof)
                 elif kind == "fill":
+                    # Length, then a counted parameter block.
                     inner = Buffer(capacity=BUF_SIZE, vi64=prof.vi64)
                     MOQTMessage._serialize_params(inner, param_value,
                                                   prof=prof)
@@ -878,10 +890,11 @@ class MOQTMessage:
                             scope: Optional[str] = None) -> Dict[int, Any]:
         """Deserialize a parameter block (see _pull_params).
 
-        FILL_PARAMETERS is read count-prefixed (PR #2015). Transition
-        tolerance for the published d20/d22 text: a block with a
+        FILL_PARAMETERS is read length-prefixed (d20/d22): a counted
+        block, or bare parameters to the value's end. A block with a
         FILL_PARAMETERS that does not parse that way, or does not end at
-        buf_end, is reread with the value length-prefixed."""
+        buf_end, is reread with the value count-prefixed and no Length
+        (moq-transport PR #2015)."""
         start = buf.tell()
         fill = []
         try:
@@ -901,7 +914,7 @@ class MOQTMessage:
         try:
             return MOQTMessage._pull_params(
                 buf, prof=prof, buf_end=buf_end, delta_keys=delta_keys,
-                scope=scope, fill_length_prefixed=True)
+                scope=scope, fill_counted=True)
         except (MOQTProtocolViolation, BufferReadError, MOQTUnderflow) as e:
             # Report the reading that got further.
             if buf.tell() > reached:
@@ -915,8 +928,9 @@ class MOQTMessage:
                      buf_end: Optional[int] = None,
                      delta_keys: bool = None,
                      scope: Optional[str] = None,
-                     fill_length_prefixed: bool = False,
-                     fill_seen: Optional[list] = None) -> Dict[int, Any]:
+                     fill_counted: bool = False,
+                     fill_seen: Optional[list] = None,
+                     bare: bool = False) -> Dict[int, Any]:
         """
         Deserialize parameters using Key-Value-Pair structure.
 
@@ -924,7 +938,8 @@ class MOQTMessage:
         delta-decoded). When buf_end is supplied the parameter block is
         bounded to it: a declared count or length that would read past
         buf_end raises MOQTProtocolViolation (spec §9 — the Length
-        field is the authoritative message extent).
+        field is the authoritative message extent). bare reads
+        parameters with no Number of Parameters up to buf_end.
 
         Returns:
             Dict mapping parameter type to value
@@ -935,12 +950,15 @@ class MOQTMessage:
         if delta_keys is None:
             delta_keys = prof.params_delta_coded
         params = {}
-        param_count = buf.pull_vint()
+        param_count = None if bare else buf.pull_vint()
         prev_key = 0
         d20 = prof.draft >= 18 and prof.param_table >= 20
         allowed = param_scope(prof).get(scope) if prof.draft >= 18 else None
 
-        for param_index in range(param_count):
+        for param_index in (itertools.count() if bare
+                            else range(param_count)):
+            if bare and buf.tell() >= buf_end:
+                break
             if buf_end is not None and buf.tell() >= buf_end:
                 raise MOQTProtocolViolation(
                     f"parameters declared {param_count} but buffer "
@@ -979,25 +997,31 @@ class MOQTMessage:
                 elif kind == "range_filter":
                     param_value = RangeFilter.decode(
                         buf, param_type, prof=prof, buf_end=buf_end)
-                elif kind == "fill" and not fill_length_prefixed:
-                    if fill_seen is not None:
-                        fill_seen.append(param_type)
+                elif kind == "fill" and fill_counted:
                     param_value = MOQTMessage._pull_params(
                         buf, prof=prof, buf_end=buf_end,
                         scope="FillParameters")
                 elif kind == "fill":
+                    if fill_seen is not None:
+                        fill_seen.append(param_type)
                     param_len = buf.pull_vint()
                     value_end = buf.tell() + param_len
                     if buf_end is not None and value_end > buf_end:
                         raise MOQTProtocolViolation(
                             f"FILL_PARAMETERS length {param_len} exceeds "
                             f"remaining {buf_end - buf.tell()}")
-                    if param_len == 0:
-                        raise MOQTProtocolViolation(
-                            "FILL_PARAMETERS has no Number of Parameters")
+                    # Value is a counted block, or a bare parameter run
+                    # to its end: no Table 7 type is below 0x0A, so a
+                    # first varint below 0x0A is a Number of Parameters.
+                    fill_bare = False
+                    if param_len:
+                        mark = buf.tell()
+                        fill_bare = buf.pull_vint() >= 0x0A
+                        buf.seek(mark)
                     param_value = MOQTMessage._pull_params(
                         buf, prof=prof, buf_end=value_end,
-                        scope="FillParameters")
+                        scope="FillParameters", bare=fill_bare) \
+                        if param_len else {}
                     if buf.tell() != value_end:
                         raise MOQTProtocolViolation(
                             "FILL_PARAMETERS does not fill its length")
